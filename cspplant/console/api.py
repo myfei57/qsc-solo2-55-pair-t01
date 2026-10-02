@@ -55,8 +55,10 @@ class Api:
         add("GET", "/api/journal", self._journal)
         add("GET", "/api/store", self._store)
         add("GET", "/api/readiness", self._readiness)
+        add("GET", "/api/arrival-plan", lambda params, body: self._platform.arrival_plan())
         add("GET", "/api/window", lambda params, body: {"mirrors": self._platform.mirrors_in_window()})
         add("POST", "/api/track", self._track)
+        add("POST", "/api/readback", self._readback)
         add("POST", "/api/circulate", self._circulate)
         add("POST", "/api/cycle", self._cycle)
         add("POST", "/api/dispatch", self._dispatch)
@@ -217,6 +219,11 @@ class Api:
         dni = _as_float(body, "dni_w_m2", self._platform.field.meter.current())
         minute = body.get("minute_of_day")
         return self._platform.track(dni, None if minute is None else float(minute))
+
+    def _readback(self, params: dict, body: dict) -> dict:
+        return self._platform.set_mirror_readback(
+            str(body.get("mirror", "m021")), bool(body.get("ok", True))
+        )
 
     def _circulate(self, params: dict, body: dict) -> dict:
         target = body.get("target_flow_kg_s")

@@ -22,7 +22,11 @@
       "focus_threshold_w_m2": 320.0,
       "dispatch_rate_pct_s": 6.0,
       "sweep_batch": 12,
-      "safe_zone_margin_m": 6.0
+      "safe_zone_margin_m": 6.0,
+      "round_period_s": 60.0,
+      "early_lead_max_s": 30.0,
+      "coarse_aim_tolerance_deg": 1.2,
+      "lag_policies": {"a": "coarse", "b": "exit", "c": "exit"}
     },
     "receiver": {
       "temp_target_c": 600.0,

@@ -35,6 +35,12 @@ class HeliostatDrive:
         self._aimed = False
         self._turns = 0
         self._rate_limited = 0
+        # 驱动回读默认在线；置失后无法证明当前角度，到位判定一律按没跟上。
+        self._readback_ok = True
+        self._readback_failures = 0
+        # 对焦精度档位：fine 用配置公差，coarse 是低一档（更宽）的追日公差。
+        self._precision = "fine"
+        self._tolerance_deg = float(limits.aim_tolerance_deg)
 
     @property
     def name(self) -> str:
@@ -82,14 +88,35 @@ class HeliostatDrive:
         if active:
             self._state = MANUAL
 
-    def aim(self, target: AimAngles, *, auto: bool = True) -> AimAngles:
-        """下达追日目标；手动接管期间自动目标被拒绝。"""
+    def aim(
+        self,
+        target: AimAngles,
+        *,
+        auto: bool = True,
+        precision: str = "fine",
+        tolerance_deg: float | None = None,
+    ) -> AimAngles:
+        """下达追日目标；手动接管期间自动目标被拒绝。
+
+        ``precision`` 为 ``coarse`` 时按低一档（更宽）公差追日，公差由调用方
+        通过 ``tolerance_deg`` 显式给出，口径与到位计划一致。
+        """
 
         if auto and self._manual:
             raise InterlockError(f"{self._name} 处于手动接管，自动追日目标被拒绝", component="heliostat")
         self._target = AimAngles(normalize_azimuth(target.azimuth_deg), float(target.elevation_deg))
         self._state = TRACKING if auto else MANUAL
         self._aimed = auto
+        if not auto:
+            self._precision = "fine"
+            self._tolerance_deg = float(self._limits.aim_tolerance_deg)
+        else:
+            self._precision = "coarse" if precision == "coarse" else "fine"
+            self._tolerance_deg = (
+                float(tolerance_deg)
+                if self._precision == "coarse" and tolerance_deg is not None
+                else float(self._limits.aim_tolerance_deg)
+            )
         return self._target
 
     def defocus(self) -> AimAngles:
@@ -99,6 +126,8 @@ class HeliostatDrive:
         self._target = target
         self._state = DEFOCUS
         self._aimed = False
+        self._precision = "fine"
+        self._tolerance_deg = float(self._limits.aim_tolerance_deg)
         return target
 
     def stow(self) -> AimAngles:
@@ -109,6 +138,8 @@ class HeliostatDrive:
         self._manual = False
         self._state = STOWED
         self._aimed = False
+        self._precision = "fine"
+        self._tolerance_deg = float(self._limits.aim_tolerance_deg)
         return target
 
     def step(self, dt: float) -> AimAngles:
@@ -143,12 +174,12 @@ class HeliostatDrive:
         return AimAngles(self._azimuth, self._elevation)
 
     def aligned(self) -> bool:
-        """两个轴是否都已经到位。"""
+        """两个轴是否都已到位（回读缺失时无法证明，一律为假）。"""
 
+        if not self._readback_ok:
+            return False
         error = angle_error(self.current_angles(), self._target)
-        return self._limits.within_tolerance(error.azimuth_deg) and self._limits.within_tolerance(
-            error.elevation_deg
-        )
+        return abs(error.azimuth_deg) <= self._tolerance_deg and abs(error.elevation_deg) <= self._tolerance_deg
 
     def at_target(self) -> bool:
         """两个轴是否已经精确停在目标角度（收起与离焦用精确判定）。"""
@@ -176,6 +207,52 @@ class HeliostatDrive:
 
         return self._rate_limited
 
+    @property
+    def precision(self) -> str:
+        """当前对焦精度档位（``fine`` / ``coarse``）。"""
+
+        return self._precision
+
+    @property
+    def tolerance_deg(self) -> float:
+        """当前到位判定公差。"""
+
+        return self._tolerance_deg
+
+    @property
+    def readback_ok(self) -> bool:
+        """驱动回读是否在线。"""
+
+        return self._readback_ok
+
+    def set_readback(self, ok: bool) -> None:
+        """置位／恢复驱动回读；置失计一次回读失败。"""
+
+        ok = bool(ok)
+        if not ok and self._readback_ok:
+            self._readback_failures += 1
+        self._readback_ok = ok
+
+    def readback(self) -> AimAngles | None:
+        """返回驱动回读的当前角度；回读缺失（部分失败）时为 None。"""
+
+        if not self._readback_ok:
+            return None
+        return self.current_angles()
+
+    def readback_failures(self) -> int:
+        """返回累计回读失败次数。"""
+
+        return self._readback_failures
+
+    def within(self, tolerance_deg: float) -> bool:
+        """按给定公差评估当前误差（回读缺失时为假）。"""
+
+        if not self._readback_ok:
+            return False
+        error = angle_error(self.current_angles(), self._target)
+        return abs(error.azimuth_deg) <= tolerance_deg and abs(error.elevation_deg) <= tolerance_deg
+
     def aim_snapshot(self) -> AimSnapshot:
         """返回对焦精度快照。"""
 
@@ -185,8 +262,7 @@ class HeliostatDrive:
             elevation_deg=self._elevation,
             azimuth_error_deg=error.azimuth_deg,
             elevation_error_deg=error.elevation_deg,
-            within_tolerance=self._limits.within_tolerance(error.azimuth_deg)
-            and self._limits.within_tolerance(error.elevation_deg),
+            within_tolerance=self.aligned(),
         )
 
     def snapshot(self) -> HeliostatSnapshot:
@@ -202,4 +278,6 @@ class HeliostatDrive:
             target_azimuth_deg=self._target.azimuth_deg,
             target_elevation_deg=self._target.elevation_deg,
             turns=self._turns,
+            readback_ok=self._readback_ok,
+            precision=self._precision,
         )

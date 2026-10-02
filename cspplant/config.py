@@ -117,15 +117,55 @@ class FieldLimits:
     dispatch_rate_pct_s: float
     sweep_batch: int
     safe_zone_margin_m: float
+    round_period_s: float = 60.0
+    early_lead_max_s: float = 30.0
+    coarse_aim_tolerance_deg: float = 1.2
+    lag_policies: dict | None = None
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "FieldLimits":
-        return cls(
+        period = _number(section, "round_period_s", minimum=1.0)
+        lead = _number(section, "early_lead_max_s", minimum=0.0)
+        coarse = _number(section, "coarse_aim_tolerance_deg", minimum=0.0)
+        raw_policies = section.get("lag_policies", {})
+        if not isinstance(raw_policies, Mapping):
+            raise ConfigError("lag_policies 必须是镜区到处置策略的映射", component="config")
+        policies: dict[str, str] = {}
+        for group, policy in raw_policies.items():
+            if not isinstance(group, str) or policy not in ("coarse", "exit"):
+                raise ConfigError(
+                    f"镜区 {group!r} 的落后处置必须是 coarse 或 exit", component="config"
+                )
+            policies[group] = str(policy)
+        limits = cls(
             focus_threshold_w_m2=_number(section, "focus_threshold_w_m2", minimum=0.0),
             dispatch_rate_pct_s=_number(section, "dispatch_rate_pct_s", minimum=0.1),
             sweep_batch=_integer(section, "sweep_batch", minimum=1),
             safe_zone_margin_m=_number(section, "safe_zone_margin_m", minimum=0.0),
+            round_period_s=period,
+            early_lead_max_s=lead,
+            coarse_aim_tolerance_deg=coarse,
+            lag_policies=policies,
         )
+        if limits.early_lead_max_s >= limits.round_period_s:
+            raise ConfigError("提前起转上限必须小于本轮窗口长度", component="config")
+        return limits
+
+    @property
+    def lag_policy(self) -> dict[str, str]:
+        """镜区落后处置表（``coarse`` 低一档追日 / ``exit`` 退出聚焦）。"""
+
+        return dict(self._lag_policies_normalized)
+
+    def policy_for_group(self, group: str) -> str:
+        """取镜区处置策略；未登记镜区按最保守的退出聚焦。"""
+
+        return self.lag_policy.get(str(group), "exit")
+
+    def __post_init__(self) -> None:
+        if self.lag_policies is None:
+            object.__setattr__(self, "lag_policies", {"a": "coarse", "b": "exit", "c": "exit"})
+        object.__setattr__(self, "_lag_policies_normalized", dict(self.lag_policies))
 
 
 @dataclass(frozen=True)
@@ -311,12 +351,16 @@ class PlatformConfig:
             raise ConfigError("platform.storage_root 必须是非空字符串", component="config")
 
         limits = _section(mapping, "limits")
+        field_limits = FieldLimits.from_mapping(_section(limits, "field"))
+        heliostat_limits = HeliostatLimits.from_mapping(_section(limits, "heliostat"))
+        if field_limits.coarse_aim_tolerance_deg <= heliostat_limits.aim_tolerance_deg:
+            raise ConfigError("低档对焦公差必须宽于对焦公差", component="config")
         return cls(
             name=name,
             storage_root=storage_root,
-            heliostat=HeliostatLimits.from_mapping(_section(limits, "heliostat")),
+            heliostat=heliostat_limits,
             irradiance=IrradianceLimits.from_mapping(_section(limits, "irradiance")),
-            field=FieldLimits.from_mapping(_section(limits, "field")),
+            field=field_limits,
             receiver=ReceiverLimits.from_mapping(_section(limits, "receiver")),
             salt=SaltLimits.from_mapping(_section(limits, "salt")),
             steam=SteamLimits.from_mapping(_section(limits, "steam")),
@@ -345,7 +389,7 @@ def default_config() -> PlatformConfig:
         storage_root="var/state",
         heliostat=HeliostatLimits(0.6, 1.2, 0.9, 12.0, 450.0, 0.94),
         irradiance=IrradianceLimits(250.0, 1100.0, 30.0, 180.0),
-        field=FieldLimits(320.0, 6.0, 12, 6.0),
+        field=FieldLimits(320.0, 6.0, 12, 6.0, 60.0, 30.0, 1.2, {"a": "coarse", "b": "exit", "c": "exit"}),
         receiver=ReceiverLimits(600.0, 620.0, 720.0, 42.0, 20.0, 8.0, 22.0),
         salt=SaltLimits(18.0, 96.0, 1.4, 15.0, 58.0, 9.0, 2.5, 3.4),
         steam=SteamLimits(12.0, 0.8, 6.0, 30.0, 1.0),
@@ -379,6 +423,10 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
                 "dispatch_rate_pct_s": cfg.field.dispatch_rate_pct_s,
                 "sweep_batch": cfg.field.sweep_batch,
                 "safe_zone_margin_m": cfg.field.safe_zone_margin_m,
+                "round_period_s": cfg.field.round_period_s,
+                "early_lead_max_s": cfg.field.early_lead_max_s,
+                "coarse_aim_tolerance_deg": cfg.field.coarse_aim_tolerance_deg,
+                "lag_policies": dict(cfg.field.lag_policies),
             },
             "receiver": {
                 "temp_target_c": cfg.receiver.temp_target_c,

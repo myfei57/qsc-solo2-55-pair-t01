@@ -375,7 +375,7 @@ class Platform:
     # ---- 操作编排 -----------------------------------------------------
 
     def track(self, dni_w_m2: float, minute_of_day: float | None = None) -> dict:
-        """追日：采集 → 落盘 → 判定 → 下发。"""
+        """追日：采集 → 落盘 → 判定 → 到位计划 → 按序执行与验证。"""
 
         with self._lock:
             op_id = self.ids.next()
@@ -384,9 +384,101 @@ class Platform:
                 self.field, dni_w_m2, sun, self.clock.now(), latched=self.latch.latched()
             )
             summary = self._record_operation(op_id, "track", report)
+            self._record_arrival_plan(report)
             self._operations += 1
             self._persist()
             return {**report, **summary}
+
+    def _record_arrival_plan(self, report: dict) -> None:
+        """把本轮冻结的到位计划与逐台落后处置落审计。
+
+        计划是指令、判定与审计三者的唯一口径：这里落的就是随后执行与验证的
+        同一份对象，不重新计算。逐台条目与有序指令允许嵌套（总线在记录普通
+        步骤时会剥掉嵌套字段），所以直接走审计记录，不经步骤过滤。
+        """
+
+        plan = report.get("plan")
+        if not isinstance(plan, dict):
+            return
+        self.audit.record(
+            AuditRecord.create(
+                ts=self.clock.now(),
+                asset="",
+                component="field",
+                action="arrival_plan",
+                severity="notice",
+                message=(
+                    f"第 {plan['round']} 轮到位计划："
+                    f"{plan['counts']['in_time']} 台来得及、"
+                    f"{plan['counts']['early_start']} 台提前起转、"
+                    f"{plan['counts']['lag']} 台没跟上"
+                ),
+                plan_id=plan["plan_id"],
+                round=plan["round"],
+                period_s=plan["period_s"],
+                max_lead_s=plan["max_lead_s"],
+                counts=dict(plan["counts"]),
+                policies=dict(plan["policies"]),
+                entries=list(plan["entries"]),
+                commands=list(plan["commands"]),
+            )
+        )
+        for outcome in report.get("outcomes", []):
+            severity = "alarm" if not outcome.get("readback_ok", True) else "warning"
+            lagging = bool(outcome.get("lagged"))
+            # 计划判来得及、窗口末却没到细公差的镜子也要留痕（口径同验证）。
+            fine_miss = (
+                outcome.get("verdict") == "in_time"
+                and outcome.get("action") == "aim"
+                and outcome.get("grade") == "fine"
+                and not outcome.get("within_fine", True)
+            )
+            if not lagging and not fine_miss:
+                continue
+            self.audit.record(
+                AuditRecord.create(
+                    ts=self.clock.now(),
+                    asset=str(outcome.get("mirror", "")),
+                    component="field",
+                    action="mirror_lagging",
+                    severity=severity,
+                    message=(
+                        f"{outcome['mirror']} 没跟上"
+                        + ("（驱动回读缺失，部分失败）" if not outcome.get("readback_ok", True) else "")
+                    ),
+                    plan_id=plan["plan_id"],
+                    group=outcome.get("group", ""),
+                    verdict=outcome.get("verdict", ""),
+                    command=outcome.get("action", ""),
+                    grade=outcome.get("grade", ""),
+                    reason=outcome.get("reason", ""),
+                    readback_ok=bool(outcome.get("readback_ok", True)),
+                )
+            )
+
+    def arrival_plan(self) -> dict:
+        """返回最近一轮冻结的到位计划（控制台展示用）。"""
+
+        plan = self.field.arrival_plan()
+        return {"available": plan is not None, "plan": plan}
+
+    def set_mirror_readback(self, mirror: str, ok: bool) -> dict:
+        """置位／恢复一台镜子的驱动回读，供现场故障注入与恢复确认。"""
+
+        with self._lock:
+            drive = self.field.drive(mirror)
+            drive.set_readback(bool(ok))
+            self.bus.publish(
+                Event.of(
+                    "field",
+                    "field",
+                    "readback_restored" if ok else "readback_lost",
+                    asset=mirror,
+                    severity="notice" if ok else "warning",
+                    message=f"{mirror} 驱动回读已恢复" if ok else f"{mirror} 驱动回读缺失",
+                )
+            )
+            return {"mirror": mirror, "readback_ok": drive.readback_ok}
 
     def circulate(self, target_flow_kg_s: float | None = None) -> dict:
         """建立熔盐循环：启泵 → 流量确认 → 通盐。"""

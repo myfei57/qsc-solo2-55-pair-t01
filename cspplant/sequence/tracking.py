@@ -44,7 +44,7 @@ def acquire_and_track(
     report = field.track(sun, now, latched)
     steps.extend(report["steps"])
     violations.extend(report["violations"])
-    return {
+    result = {
         "ok": report["ok"] and not violations,
         "mode": report.get("mode", ""),
         "reason": report.get("reason", ""),
@@ -52,3 +52,9 @@ def acquire_and_track(
         "violations": violations,
         "aimed": report.get("aimed", 0),
     }
+    # 到位计划与逐台执行结果原样透传，供审计落盘与控制台展示。
+    if "plan" in report:
+        result["plan"] = report["plan"]
+    if "outcomes" in report:
+        result["outcomes"] = report["outcomes"]
+    return result

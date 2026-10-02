@@ -16,6 +16,20 @@ import threading
 from ..config import FieldLimits, HeliostatLimits, IrradianceLimits
 from ..errors import AlignmentError, InterlockError
 from ..heliostat.aim import AimAngles, AimPoint, aim_angles_for, stow_angles
+from ..heliostat.arrival import (
+    ACTION_AIM,
+    ACTION_DEFOCUS,
+    EARLY_START,
+    GRADE_COARSE,
+    IN_TIME,
+    LAG,
+    PHASE_EXIT,
+    ArrivalInput,
+    RoundPlan,
+    build_round_plan,
+    lead_ticks,
+    period_ticks,
+)
 from ..heliostat.drive import DEFOCUS, STOWED, TRACKING, HeliostatDrive
 from ..heliostat.registry import HeliostatRegistry
 from ..heliostat.sun import SunPosition
@@ -25,6 +39,7 @@ from .dispatch import DispatchController, DispatchOutcome
 from .irradiance import IrradianceMeter, IrradianceSample
 from .manual import ManualLease, ManualOverride
 from .persist import FieldPersistence
+from .round import RoundOutcome
 from .snapshot import FieldSnapshot
 from .strategy import FOCUS, NOT_EVALUATED, STANDBY, STOW, FieldStrategy, StrategyDecision
 from .sweep import SweepPlanner, SweepWindow
@@ -68,6 +83,8 @@ class FieldController:
             for mirror in registry.all()
         }
         self._last_decision: StrategyDecision | None = None
+        self._last_plan: RoundPlan | None = None
+        self._round_no = 0
         self._lock = threading.RLock()
         self._restore()
 
@@ -219,53 +236,203 @@ class FieldController:
                     "aimed": 0,
                 }
 
-            aimed = 0
-            skipped = 0
-            for mirror in self._registry.all():
-                drive = self._drives[mirror.name]
-                if drive.excluded or drive.manual:
-                    skipped += 1
-                    continue
-                target = aim_angles_for(mirror.x_m, mirror.y_m, mirror.z_m, sun, self._aim_point)
-                drive.aim(target)
-                aimed += 1
+            plan = self._build_round_plan(sun, now)
             steps.append(
                 {
                     "component": "field",
-                    "action": "aim",
-                    "detail": {"aimed": aimed, "skipped": skipped, "dni_w_m2": round(durable, 2)},
+                    "action": "arrival_plan",
+                    "detail": {
+                        "plan_id": plan.plan_id,
+                        "round": plan.round,
+                        "planned": len(plan.entries),
+                        "in_time": plan.count(IN_TIME),
+                        "early_start": plan.count(EARLY_START),
+                        "lag": plan.count(LAG),
+                        "lead_budget_s": round(plan.lead_budget_s(), 3),
+                    },
                 }
             )
-            aligned = self._settle()
+            executed, outcomes = self._execute_round(plan)
             steps.append(
                 {
                     "component": "field",
-                    "action": "settle",
-                    "detail": {"aligned": aligned, "aimed": aimed},
+                    "action": "round_execute",
+                    "detail": {"plan_id": plan.plan_id, "commands": len(executed)},
                 }
             )
-            if aligned < aimed:
-                violations.append("aim_incomplete")
+            verified = self._verify_round(plan, outcomes)
+            steps.append(
+                {
+                    "component": "field",
+                    "action": "round_verify",
+                    "detail": {
+                        "plan_id": plan.plan_id,
+                        "fine": verified["fine"],
+                        "coarse": verified["coarse"],
+                        "exited": verified["exited"],
+                        "readback_missing": verified["readback_missing"],
+                        "not_arrived": verified["not_arrived"],
+                    },
+                }
+            )
+            violations.extend(verified["violations"])
             return {
                 "ok": not violations,
                 "mode": decision.mode,
                 "reason": decision.reason,
                 "steps": steps,
                 "violations": violations,
-                "aimed": aligned,
+                "aimed": verified["fine"],
+                "plan": plan.as_dict(),
+                "outcomes": [outcome.as_dict() for outcome in outcomes],
             }
 
-    def _settle(self) -> int:
-        """推进所有驱动直到到位或步数用尽，返回到位台数。"""
+    # ---- 到位计划与一轮时序 -------------------------------------------
 
-        pending = [drive for drive in self._drives.values() if drive.state == TRACKING]
-        for _ in range(MAX_STEPS):
-            if not pending:
-                break
-            for drive in list(pending):
+    def _build_round_plan(self, sun: SunPosition, now: float) -> RoundPlan:
+        """窗口起点逐台判定并冻结本轮到位计划。"""
+
+        self._round_no += 1
+        inputs: list[ArrivalInput] = []
+        skipped: list[tuple[str, str, str]] = []
+        for mirror in self._registry.all():
+            drive = self._drives[mirror.name]
+            if drive.excluded:
+                skipped.append((mirror.name, mirror.group, "excluded"))
+                continue
+            if drive.manual:
+                skipped.append((mirror.name, mirror.group, "manual"))
+                continue
+            target = aim_angles_for(mirror.x_m, mirror.y_m, mirror.z_m, sun, self._aim_point)
+            # 驱动回读缺失（部分失败）：current 为 None，计划里直接按没跟上处理。
+            inputs.append(ArrivalInput(mirror.name, mirror.group, drive.readback(), target))
+
+        plan = build_round_plan(
+            f"round-{self._round_no:06d}",
+            self._round_no,
+            now,
+            inputs,
+            period_s=self._limits.round_period_s,
+            max_lead_s=self._limits.early_lead_max_s,
+            azimuth_rate_deg_s=self._heliostat_limits.azimuth_rate_deg_s,
+            elevation_rate_deg_s=self._heliostat_limits.elevation_rate_deg_s,
+            coarse_tolerance_deg=self._limits.coarse_aim_tolerance_deg,
+            policies=self._limits.lag_policies,
+            skipped=tuple(skipped),
+        )
+        self._last_plan = plan
+        return plan
+
+    def _execute_round(self, plan: RoundPlan) -> tuple[list[dict], list[RoundOutcome]]:
+        """严格按计划顺序执行：起转相位（含提前起转）→ 退出相位。
+
+        指令也按相位下达：起转相位开始前只下起转指令，提前起转组先吃 lead
+        预算，随后全部起转镜一起转满 ``period_s``；起转相位走完、窗口末验证
+        之后，才向退出镜下达离焦指令并转到姿态。退出指令不可能先于起转生效，
+        一轮时序因此定死。
+        """
+
+        commands = plan.commands()
+        start_cmds = [cmd for cmd in commands if cmd.phase == "start"]
+        exit_cmds = [cmd for cmd in commands if cmd.phase == PHASE_EXIT]
+        early = {cmd.mirror for cmd in start_cmds if cmd.verdict == EARLY_START}
+        executed: list[dict] = []
+
+        # 相位 1：只下起转指令（含提前起转、低档追日、正常起转）。
+        for cmd in start_cmds:
+            drive = self._drives[cmd.mirror]
+            drive.aim(
+                plan.named(cmd.mirror).target,
+                auto=True,
+                precision=GRADE_COARSE if cmd.grade == GRADE_COARSE else "fine",
+                tolerance_deg=plan.coarse_tolerance_deg,
+            )
+            executed.append(cmd.as_dict())
+
+        if early:
+            early_drives = [self._drives[name] for name in early]
+            for _ in range(lead_ticks(plan)):
+                for drive in early_drives:
+                    drive.step(1.0)
+
+        start_drives = [self._drives[cmd.mirror] for cmd in start_cmds]
+        for _ in range(period_ticks(plan)):
+            for drive in start_drives:
                 drive.step(1.0)
-            pending = [drive for drive in pending if not drive.aligned()]
-        return sum(1 for drive in self._drives.values() if drive.aligned())
+
+        # 窗口末先按起转结果验证（计划、指令、验证同一份对象）。
+        outcomes = [
+            RoundOutcome.from_drive(plan.named(cmd.mirror), self._drives[cmd.mirror], phase_executed=True)
+            for cmd in start_cmds
+        ]
+
+        # 相位 2：起转全部完成后才下达退出指令，再转到离焦姿态。
+        for cmd in exit_cmds:
+            self._drives[cmd.mirror].defocus()
+            executed.append(cmd.as_dict())
+        exit_drives = [self._drives[cmd.mirror] for cmd in exit_cmds]
+        for _ in range(period_ticks(plan)):
+            for drive in exit_drives:
+                drive.step(1.0)
+        outcomes.extend(
+            RoundOutcome.from_drive(plan.named(cmd.mirror), self._drives[cmd.mirror], phase_executed=True)
+            for cmd in exit_cmds
+        )
+        return executed, outcomes
+
+    def _verify_round(self, plan: RoundPlan, outcomes: list[RoundOutcome]) -> dict:
+        """窗口末按同一份计划逐台验证：计划档位、回读到位情况与处置是否一致。"""
+
+        fine = coarse = exited = readback_missing = not_arrived = 0
+        violations: list[str] = []
+        for outcome in outcomes:
+            if not outcome.readback_ok:
+                # 回读缺失（计划阶段或执行中）都是部分失败，按没跟上处理。
+                readback_missing += 1
+            if outcome.action == ACTION_DEFOCUS:
+                exited += 1
+                if outcome.lagged:
+                    not_arrived += 1
+                    violations.append(
+                        f"exit_not_confirmed:{outcome.mirror}"
+                        if outcome.readback_ok
+                        else f"readback_lost:{outcome.mirror}"
+                    )
+            elif outcome.grade == GRADE_COARSE:
+                coarse += 1
+                if outcome.lagged:
+                    not_arrived += 1
+                    violations.append(
+                        f"coarse_not_arrived:{outcome.mirror}"
+                        if outcome.readback_ok
+                        else f"readback_lost:{outcome.mirror}"
+                    )
+            else:
+                if outcome.lagged:
+                    not_arrived += 1
+                    violations.append(
+                        f"readback_lost:{outcome.mirror}"
+                        if not outcome.readback_ok
+                        else f"aim_incomplete:{outcome.mirror}"
+                    )
+                else:
+                    fine += 1
+        expected = sum(1 for item in plan.entries if item.action != "skip")
+        if len(outcomes) != expected:
+            violations.append("plan_command_mismatch")
+        return {
+            "fine": fine,
+            "coarse": coarse,
+            "exited": exited,
+            "readback_missing": readback_missing,
+            "not_arrived": not_arrived,
+            "violations": violations,
+        }
+
+    def arrival_plan(self) -> dict | None:
+        """返回最近一轮冻结的到位计划，供控制台展示与审计核对。"""
+
+        return None if self._last_plan is None else self._last_plan.as_dict()
 
     def _park_all(self) -> int:
         """把非手动、非避让的镜子转到离焦姿态。"""
@@ -479,6 +646,13 @@ class FieldController:
             "dispatch_requested_pct": round(self._dispatch.requested(), 3),
             "dispatch_clamps": self._dispatch.clamps(),
             "dispatch_resolves": self._dispatch.resolves(),
+            "arrival_round": 0 if self._last_plan is None else self._last_plan.round,
+            "arrival_plan": None if self._last_plan is None else self._last_plan.as_dict()["counts"],
+            "lag_policies": {
+                group: self._limits.policy_for_group(group)
+                for group in self._registry.groups()
+            },
+            "readback_failures": sum(drive.readback_failures() for drive in self._drives.values()),
         }
 
     def snapshot(self) -> FieldSnapshot:

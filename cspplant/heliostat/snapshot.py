@@ -38,6 +38,8 @@ class HeliostatSnapshot:
     target_azimuth_deg: float
     target_elevation_deg: float
     turns: int
+    readback_ok: bool = True
+    precision: str = "fine"
 
     def as_dict(self) -> dict:
         return {
@@ -50,4 +52,6 @@ class HeliostatSnapshot:
             "target_azimuth_deg": round(self.target_azimuth_deg, 3),
             "target_elevation_deg": round(self.target_elevation_deg, 3),
             "turns": self.turns,
+            "readback_ok": self.readback_ok,
+            "precision": self.precision,
         }
