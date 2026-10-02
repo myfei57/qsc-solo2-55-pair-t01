@@ -85,6 +85,10 @@ class FieldController:
         return self._limits
 
     @property
+    def heliostat_limits(self) -> HeliostatLimits:
+        return self._heliostat_limits
+
+    @property
     def aim_point(self) -> AimPoint:
         return self._aim_point
 

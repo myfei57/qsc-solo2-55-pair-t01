@@ -11,7 +11,6 @@ from __future__ import annotations
 import dataclasses
 import math
 import threading
-
 from .alarm.escalation import EscalationPolicy
 from .alarm.history import AlarmHistory
 from .alarm.latch import FaultLatch
@@ -22,6 +21,7 @@ from .clock import Clock, SystemClock
 from .config import PlatformConfig, default_config
 from .errors import PlantError
 from .eventbus import Event, EventBus
+from .field.arrival import ArrivalRunner
 from .field.field import FieldController
 from .field.persist import FieldPersistence
 from .heliostat.aim import AimPoint
@@ -128,6 +128,13 @@ class Platform:
             AimPoint(0.0, 0.0, AIM_POINT_Z_M),
             maintenance_reach_m=MAINTENANCE_REACH_M,
             manual_hold_s=MANUAL_HOLD_S,
+        )
+        self.arrivals = ArrivalRunner(
+            self.field,
+            self.heliostats,
+            bus=self.bus,
+            clock=self.clock,
+            store=store,
         )
 
         threshold = ThresholdModel(self.config.salt)
@@ -387,6 +394,110 @@ class Platform:
             self._operations += 1
             self._persist()
             return {**report, **summary}
+
+    def track_round(
+        self,
+        window_s: float = 60.0,
+        minute_of_day: float | None = None,
+        *,
+        missing_readbacks: list[str] | None = None,
+    ) -> dict:
+        """封存到位计划并按封存时序跑完一轮：提前起转 → 统一起转 → 截止判定。
+
+        镜场必须已在聚焦模式下追日；时钟只按整秒推进（标定/演示用
+        :class:`ManualClock`）。``missing_readbacks`` 里的镜子在截止回读中
+        被摘掉，模拟驱动回读链路缺失，按"没跟上"处理。
+        """
+
+        if window_s <= 0:
+            raise ValueError("轮次窗口必须为正")
+        missing = tuple(missing_readbacks or ())
+        with self._lock:
+            sun = self.sun_at(minute_of_day)
+            targets = self.arrivals.targets_for(sun)
+            plan = self.arrivals.plan_round(targets, window_s=window_s)
+
+            # 阶段 1：封存时刻起，逐条等到期并下发提前起转指令（严格早于统一起转）。
+            early_moved, early = self._issue_early(plan)
+            # 阶段 2：推进到统一起转时刻，下发剩余计划指令（计划内退出/降档先于正常起转）。
+            launch_moved, at_launch = self._run_until(plan.window.launch_at)
+            # 阶段 3：推进到截止时刻，让追日驱动按限速转完本轮。
+            deadline_moved, _ = self._run_until(plan.window.deadline_at)
+
+            capture = self.arrivals.capture_readbacks(now=self.clock.now())
+            readbacks = dict(capture.readbacks)
+            for name in missing:
+                readbacks.pop(name, None)
+            judge = self.arrivals.judge_round(readbacks)
+
+            statuses = judge.status_counts()
+            ok = statuses.get("lagged", 0) == 0
+            payload = {
+                "ok": ok,
+                "round_id": plan.round_id,
+                "window": plan.window.as_dict(),
+                "plan": plan.summary(),
+                "issued": self.arrivals.issued_plan_count(),
+                "early_issued": len(early),
+                "launch_issued": len(at_launch),
+                "drive_steps": early_moved + launch_moved + deadline_moved,
+                "judge": judge.as_dict(),
+                "readback_missing": len(missing),
+                "view": self.arrivals.view(),
+            }
+            self.bus.publish(
+                Event.of(
+                    "arrival", "arrival", "track_round_complete",
+                    severity="notice" if ok else "warning",
+                    message=f"轮次 {plan.round_id} 完成" if ok else f"轮次 {plan.round_id} 存在没跟上的镜子",
+                    op_id=plan.round_id,
+                    round_id=plan.round_id,
+                    ok=ok,
+                    statuses=",".join(f"{key}:{value}" for key, value in sorted(statuses.items())),
+                    lagged=statuses.get("lagged", 0),
+                    degraded=statuses.get("degraded", 0),
+                    exited=statuses.get("exited", 0),
+                )
+            )
+            self._persist()
+            return payload
+
+    def _issue_early(self, plan) -> tuple[int, list[dict]]:
+        """按封存顺序逐条下发严格早于统一起转时刻的提前起转指令。
+
+        计划时刻是分数秒时，时钟按整秒向上取整后才发——宁可晚于最晚安全
+        起转时刻几秒（仍在窗口内），也不允许提前下发打乱时序。
+        """
+
+        moved = 0
+        issued: list[dict] = []
+        while self.arrivals.issued_plan_count() < len(plan.commands):
+            command = plan.commands[self.arrivals.issued_plan_count()]
+            if command.scheduled_at >= plan.window.launch_at - 1e-9:
+                break
+            wait = max(0, math.ceil(command.scheduled_at - self.clock.now() - 1e-9))
+            for _ in range(wait):
+                self.clock.advance(1.0)
+                moved += self.arrivals.step_tracking(1.0)
+            issued.extend(self.arrivals.issue_due())
+        return moved, issued
+
+    def _run_until(self, target_time: float) -> tuple[int, list[dict]]:
+        """把时钟按整秒推进到目标时刻，每步推进驱动并下发到期指令。
+
+        到达目标时刻后再下发一次（统一起转时刻所有正常指令在这里发出）。
+        """
+
+        moved = 0
+        issued: list[dict] = []
+        steps = max(0, int(target_time - self.clock.now() + 1e-9))
+        for _ in range(steps):
+            self.clock.advance(1.0)
+            moved += self.arrivals.step_tracking(1.0)
+            issued.extend(self.arrivals.issue_due())
+        if abs(self.clock.now() - target_time) <= 1e-9:
+            issued.extend(self.arrivals.issue_due(now=target_time))
+        return moved, issued
 
     def circulate(self, target_flow_kg_s: float | None = None) -> dict:
         """建立熔盐循环：启泵 → 流量确认 → 通盐。"""
@@ -723,6 +834,7 @@ class Platform:
             "now": round(self.clock.now(), 3),
             "utc": self.clock.utc_iso(),
             "field": self.field.status(),
+            "arrival": self.arrivals.summary(),
             "receiver": self.receiver.snapshot().as_dict(),
             "receiver_heat_steps": self.receiver.heat_steps(),
             "derate_state": {

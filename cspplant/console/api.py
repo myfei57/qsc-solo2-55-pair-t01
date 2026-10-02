@@ -56,7 +56,10 @@ class Api:
         add("GET", "/api/store", self._store)
         add("GET", "/api/readiness", self._readiness)
         add("GET", "/api/window", lambda params, body: {"mirrors": self._platform.mirrors_in_window()})
+        add("GET", "/api/arrival", lambda params, body: self._platform.arrivals.view())
+        add("POST", "/api/arrival/issue", self._arrival_issue)
         add("POST", "/api/track", self._track)
+        add("POST", "/api/track-round", self._track_round)
         add("POST", "/api/circulate", self._circulate)
         add("POST", "/api/cycle", self._cycle)
         add("POST", "/api/dispatch", self._dispatch)
@@ -217,6 +220,23 @@ class Api:
         dni = _as_float(body, "dni_w_m2", self._platform.field.meter.current())
         minute = body.get("minute_of_day")
         return self._platform.track(dni, None if minute is None else float(minute))
+
+    def _track_round(self, params: dict, body: dict) -> dict:
+        minute = body.get("minute_of_day")
+        missing = body.get("missing_readbacks", [])
+        if not isinstance(missing, list):
+            raise PlantError("missing_readbacks 必须是镜名列表", component="console")
+        return self._platform.track_round(
+            window_s=_as_float(body, "window_s", 60.0),
+            minute_of_day=None if minute is None else float(minute),
+            missing_readbacks=[str(item) for item in missing],
+        )
+
+    def _arrival_issue(self, params: dict, body: dict) -> dict:
+        command_id = str(body.get("command_id", ""))
+        if not command_id:
+            raise PlantError("command_id 必填", component="console")
+        return {"issued": self._platform.arrivals.issue_command(command_id)}
 
     def _circulate(self, params: dict, body: dict) -> dict:
         target = body.get("target_flow_kg_s")
